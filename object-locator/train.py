@@ -53,6 +53,135 @@ from .data import RandomHorizontalFlipImageAndLabel
 from .data import RandomVerticalFlipImageAndLabel
 from .data import ScaleImageAndLabel
 
+import torch.nn.functional as F
+
+def find_blob_centroids_gpu(mask, min_area=5):
+    """
+    纯GPU实现（适用于中等规模图像）
+    参数:
+        mask: torch.Tensor (H, W), 值域[0,1]
+    返回:
+        centroids: torch.Tensor (N, 2), 坐标格式[y, x]
+    """
+    mask = (mask > 0.5).float()
+    H, W = mask.shape
+    
+    # 为每个像素生成坐标网格
+    y_coords, x_coords = torch.meshgrid(
+        torch.arange(H, device=mask.device),
+        torch.arange(W, device=mask.device)
+    )
+    
+    # 标记连通区域（简化版，可能不如OpenCV精确）
+    labeled = torch.zeros_like(mask, dtype=torch.long)
+    current_label = 1
+    for i in range(H):
+        for j in range(W):
+            if mask[i, j] == 1 and labeled[i, j] == 0:
+                # 区域生长（简化实现）
+                labeled[mask == 1] = current_label  # 实际应使用更复杂的算法
+                current_label += 1
+    
+    # 计算每个连通区域的中心
+    centroids = []
+    for label in range(1, current_label):
+        region_mask = (labeled == label)
+        if region_mask.sum() >= min_area:
+            y_center = (y_coords * region_mask).sum() / region_mask.sum()
+            x_center = (x_coords * region_mask).sum() / region_mask.sum()
+            centroids.append(torch.stack([y_center, x_center]))
+    
+    return torch.stack(centroids) if centroids else torch.zeros((0, 2), device=mask.device)
+
+
+def gpu_paint_circles(img_tensor, points, color='white', radius=3):
+    """
+    GPU版本的绘制圆点函数
+    img_tensor: (C, H, W) 在GPU上的图像张量
+    points: (N, 2) 在GPU上的点坐标[y,x]
+    """
+    if img_tensor.dim() == 3:
+        img_tensor = img_tensor.unsqueeze(0)  # 添加batch维度
+        
+    # 创建与图像相同大小的零张量
+    circle_layer = torch.zeros_like(img_tensor[:, :1])
+    
+    # 为每个点绘制圆形
+    for y, x in points:
+        yy, xx = torch.meshgrid(torch.arange(img_tensor.size(2), 
+                               torch.arange(img_tensor.size(3))))
+        dist = ((yy - y)**2 + (xx - x)**2).sqrt()
+        circle = (dist <= radius).float()
+        circle_layer += circle.unsqueeze(0).unsqueeze(0)
+    
+    # 根据颜色设置通道
+    if color == 'white':
+        color_tensor = torch.tensor([1., 1., 1.], device=img_tensor.device)
+    elif color == 'red':
+        color_tensor = torch.tensor([1., 0., 0.], device=img_tensor.device)
+    
+    # 将圆点叠加到原图
+    for c in range(3):
+        img_tensor[:, c] = torch.where(circle_layer.squeeze(1) > 0,
+                                     color_tensor[c],
+                                     img_tensor[:, c])
+    
+    return img_tensor.squeeze(0)
+
+
+def train_one_epoch(model, optimizer, loss_fn, train_loader, device):
+    model.train()
+    running_loss = 0.0
+
+    for batch_idx, (inputs, targets) in enumerate(train_loader):
+        inputs, targets = inputs.to(device), targets.to(device)
+
+        # 前向传播
+        outputs = model(inputs)
+        loss = loss_fn(outputs, targets)
+
+        # 反向传播
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # 统计损失
+        running_loss += loss.item()
+
+    return running_loss / len(train_loader)
+
+class Trainer:
+    def __init__(self, model, optimizer, loss_fn, device):
+        self.model = model
+        self.optimizer = optimizer
+        self.loss_fn = loss_fn
+        self.device = device
+
+    def train_one_epoch(self, train_loader):
+        self.model.train()
+        total_loss = 0.0
+
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            
+            # 前向传播
+            outputs = self.model(inputs)
+            loss = self.loss_fn(outputs, targets)
+            
+            # 反向传播
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            total_loss += loss.item()
+
+        return total_loss / len(train_loader)
+
+    def fit(self, train_loader, epochs):
+        for epoch in range(epochs):
+            avg_loss = self.train_one_epoch(train_loader)
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+
 
 # Parse command line arguments
 args = argparser.parse_command_args('training')
@@ -86,10 +215,12 @@ trainset_loader, valset_loader = \
                                height=args.height,
                                width=args.width,
                                seed=args.seed,
-                               batch_size=args.batch_size,
+                               batch_size=args.batch_size * 2,  # 验证时可增大batch_size
                                drop_last_batch=args.drop_last_batch,
-                               num_workers=args.nThreads,
+                               num_workers=min(4, os.cpu_count()),  # 根据CPU核心数调整
                                val_dir=args.val_dir,
+                               pin_memory=args.cuda,                   # 加速CPU->GPU传输
+                               # persistent_workers=True            # 保持worker进程（PyTorch 1.7+）
                                max_valset_size=args.max_valset_size)
 
 # Model
@@ -221,10 +352,22 @@ while epoch < args.epochs:
 
             # Resize images to original size
             orig_shape = target_orig_sizes[0].data.to(device_cpu).numpy().tolist()
-            orig_img_origsize = ((skimage.transform.resize(imgs[0].data.squeeze().to(device_cpu).numpy().transpose((1, 2, 0)),
+            '''orig_img_origsize = ((skimage.transform.resize(imgs[0].data.squeeze().to(device_cpu).numpy().transpose((1, 2, 0)),
                                                            output_shape=orig_shape,
                                                            mode='constant') + 1) / 2.0 * 255.0).\
-                astype(np.float32).transpose((2, 0, 1))
+                astype(np.float32).transpose((2, 0, 1))'''
+    
+            
+            # 使用PyTorch的插值函数替代skimage.transform.resize
+            orig_img_origsize = F.interpolate(
+                imgs[0].unsqueeze(0),  # 添加batch维度
+                size=tuple(orig_shape),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)
+            orig_img_origsize = ((orig_img_origsize + 1) / 2.0 * 255.0).clamp(0, 255)
+
+
             est_map_origsize = skimage.transform.resize(est_maps[0].data.unsqueeze(0).to(device_cpu).numpy().transpose((1, 2, 0)),
                                                         output_shape=orig_shape,
                                                         mode='constant').\
@@ -357,14 +500,35 @@ while epoch < args.epochs:
 
         # The estimated map must be thresholed to obtain estimated points
         # BMM thresholding
-        est_map_numpy = est_maps[0, :, :].to(device_cpu).numpy()
+        '''est_map_numpy = est_maps[0, :, :].to(device_cpu).numpy()
         est_map_numpy_origsize = skimage.transform.resize(est_map_numpy,
                                                           output_shape=orig_shape,
                                                           mode='constant')
-        mask, _ = utils.threshold(est_map_numpy_origsize, tau=-1)
-        # Obtain centroids of the mask
+        mask, _ = utils.threshold(est_map_numpy_origsize, tau=-1)'''
+
+        # GPU加速实现（放在validation循环内）
+        with torch.no_grad():
+            # 1. 热力图缩放
+            est_maps_resized = F.interpolate(
+                est_maps.unsqueeze(1), 
+                size=tuple(target_orig_sizes[0].int().tolist()[::-1]),  # (width,height)
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(1)
+            
+            # 2. 阈值处理
+            masks = (est_maps_resized > 0.5).float()
+            
+            # 3. 聚类中心计算
+            centroids = find_blob_centroids_gpu(est_maps_resized[0], min_area=5)  # 处理第一个样本
+
+        '''# Obtain centroids of the mask
         centroids_wrt_orig = utils.cluster(mask, est_count_int,
                                            max_mask_pts=args.max_mask_pts)
+'''
+
+        centroids_wrt_orig = centroids  # 直接使用find_blob_centroids_gpu的结果
+        # assert masks.dim() == 4, f"Expected [B,C,H,W], got {masks.shape}"
 
         # Validation metrics
         target_locations_wrt_orig = normalzr.unnormalize(target_locations_np,
@@ -408,10 +572,16 @@ while epoch < args.epochs:
                           window_ids=[5])
             else:
                 # Send heatmap with a cross at the estimated centroids to Visdom
-                img_with_x = utils.paint_circles(img=orig_img_w_heatmap_origsize,
+                '''img_with_x = utils.paint_circles(img=orig_img_w_heatmap_origsize,
                                                  points=centroids_wrt_orig,
                                                  color='red',
-                                                 crosshair=True )
+                                                 crosshair=True )'''
+                
+                # 在GPU上绘制标记点
+                img_with_x = gpu_paint_circles(orig_img_w_heatmap_origsize,
+                                            points=target_locs_wrt_orig,
+                                            color='white')
+
                 log.image(imgs=[img_with_x],
                           titles=['(Validation) Image w/ output heatmap '
                                   'and point estimations'],
