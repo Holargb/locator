@@ -1,19 +1,10 @@
-__copyright__ = \
-"""
-Copyright &copyright © (c) 2019 The Board of Trustees of Purdue University and the Purdue Research Foundation.
-All rights reserved.
-
-This software is covered by US patents and copyright.
-This source code is to be used for academic research purposes only, and no commercial use is allowed.
-
-For any questions, please contact Edward J. Delp (ace@ecn.purdue.edu) at Purdue University.
-
-Last Modified: 10/02/2019 
-"""
-__license__ = "CC BY-NC-SA 4.0"
-__authors__ = "Javier Ribera, David Guera, Yuhao Chen, Edward J. Delp"
-__version__ = "1.6.0"
-
+# Copyright &copyright 2018 The Board of Trustees of Purdue University.
+# All rights reserved.
+# 
+# This source code is not to be distributed or modified
+# without the written permission of Edward J. Delp at Purdue University
+# Contact information: ace@ecn.purdue.edu
+# =====================================================================
 
 import math
 import torch
@@ -145,11 +136,12 @@ class WeightedHausdorffDistance(nn.Module):
         self.all_img_locations = torch.from_numpy(cartesian([np.arange(resized_height),
                                                              np.arange(resized_width)]))
         # Convert to appropiate type
-        self.all_img_locations = self.all_img_locations.to(device=device,
-                                                           dtype=torch.get_default_dtype())
+        self.all_img_locations = torch.tensor(self.all_img_locations,
+                                              dtype=torch.get_default_dtype()).to(device)
 
         self.return_2_terms = return_2_terms
-        self.p = p
+
+        self.p = nn.Parameter(torch.tensor(-4.0))
 
     def forward(self, prob_map, gt, orig_sizes):
         """
@@ -164,12 +156,9 @@ class WeightedHausdorffDistance(nn.Module):
                    Must be of size B as in prob_map.
                    Each element in the list must be a 2D Tensor,
                    where each row is the (y, x), i.e, (row, col) of a GT point.
-        :param orig_sizes: Bx2 Tensor containing the size
-                           of the original images.
-                           B is batch size.
-                           The size must be in (height, width) format.
-        :param orig_widths: List of the original widths for each image
-                            in the batch.
+        :param orig_sizes: Bx2 Tensor containing the size of the original images.
+                           B is batch size. The size must be in (height, width) format.
+        :param orig_widths: List of the original width for each image in the batch.
         :return: Single-scalar Tensor with the Weighted Hausdorff Distance.
                  If self.return_2_terms=True, then return a tuple containing
                  the two terms of the Weighted Hausdorff Distance.
@@ -267,18 +256,6 @@ def generaliz_mean(tensor, dim, p=-9, keepdim=False):
     :param p: (float<0).
     """
     assert p < 0
-    res= torch.mean((tensor + 1e-6)**p, dim, keepdim=keepdim)**(1./p)
+    res= torch.sum(tensor * F.softmax(-tensor * torch.abs(p), dim=dim), dim=dim, keepdim=keepdim)
     return res
 
-
-"""
-Copyright &copyright © (c) 2019 The Board of Trustees of Purdue University and the Purdue Research Foundation.
-All rights reserved.
-
-This software is covered by US patents and copyright.
-This source code is to be used for academic research purposes only, and no commercial use is allowed.
-
-For any questions, please contact Edward J. Delp (ace@ecn.purdue.edu) at Purdue University.
-
-Last Modified: 10/02/2019 
-"""
